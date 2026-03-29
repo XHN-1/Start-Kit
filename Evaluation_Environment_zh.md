@@ -10,10 +10,10 @@
 
 在竞赛**任意赛道**中，不得修改或干扰 start kit 的任何功能，包括以下文件：
 ```
-src/ActionModel.cpp, src/Evaluation.cpp, src/Logger.cpp, src/States.cpp,src/driver.cpp,
-src/CompetitionSystem.cpp, src/Grid.cpp, src/common.cpp, src/TaskManager.cpp, 
+src/ActionModel.cpp, src/Evaluation.cpp, src/Logger.cpp, src/States.cpp, src/driver.cpp,
+src/CompetitionSystem.cpp, src/Grid.cpp, src/common.cpp, src/TaskManager.cpp, src/Simulator.cpp, src/DelayGenerator.cpp
 inc/ActionModel.h, inc/Evaluation.h, inc/Logger.h, inc/SharedEnv.h, inc/Tasks.h, inc/CompetitionSystem.h, inc/Grid.h,
-inc/States.h, inc/common.h, inc/TaskManager.h,
+inc/States.h, inc/common.h, inc/TaskManager.h, inc/Simulator.h, inc/DelayGenerator.h
 default_planner/Memory.h, default_planner/heap.h, default_planner/pibt.cpp, default_planner/search_node.h, 
 default_planner/planner.h, default_planner/search.cpp, default_planner/utils.cpp, default_planner/TrajLNS.h,
 default_planner/flow.cpp, default_planner/heuristics.cpp, default_planner/pibt.h, default_planner/scheduler.cpp,
@@ -25,15 +25,17 @@ python/user_scheduler/pyTaskScheduler.hpp, python/common/pyEnvironment.hpp,
 python/default_scheduler/pyTaskScheduler.cpp, python/user_planner/pyMAPFPlanner.hpp, python/set_track.bash        
 ```
 
-在**规划赛道**中，不得修改或干扰 start kit 的任何功能，包括以下文件：
+在**执行赛道（executor track）**中，不得修改或干扰 start kit 的任何功能，包括以下文件：
 ```
-inc/TaskScheduler.h, src/TaskScheduler.cpp, inc/Entry.h, src/Entry.cpp
+inc/MAPFPlanner.h, src/MAPFPlanner.cpp, inc/TaskScheduler.h, src/TaskScheduler.cpp, inc/Entry.h, src/Entry.cpp, inc/Plan.h
 ```
 
 在**调度赛道**中，不得修改或干扰 start kit 的任何功能，包括以下文件：
 ```
-inc/MAPFPlanner.h, src/MAPFPlanner.cpp, inc/Entry.h, src/Entry.cpp
+inc/MAPFPlanner.h, src/MAPFPlanner.cpp, inc/Entry.h, src/Entry.cpp, inc/Executor.h, src/Executor.cpp, inc/Plan.h
 ```
+
+该限制不仅限于直接修改文件。您不得以任何方式更改、覆盖、伪造或以其他方式扭曲这些受保护功能的行为，无论是直接还是通过其他模块、共享数据结构、副作用或运行时交互间接进行。
 
 ## 评测服务器硬件规格
 
@@ -162,7 +164,7 @@ pip                       24.2
 pkginfo                   1.11.1
 pkgutil_resolve_name      1.3.10
 platformdirs              4.2.2
-pluggy                    5.0
+pluggy                    1.5.0
 prompt_toolkit            3.0.47
 psutil                    6.0.0
 ptyprocess                0.7.0

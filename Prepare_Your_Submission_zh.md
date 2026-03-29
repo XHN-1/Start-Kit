@@ -1,128 +1,284 @@
 # 准备您的参赛作品
-要运行程序，请参阅 [README.md](./README.md) 下载 start-kit 并完成编译。 
 
+要运行程序，请参阅 [README.md](./README.md) 下载 start-kit 并完成编译。
+
+本文档说明：
+- 竞赛系统如何调用 `Entry`、`Planner`、`Scheduler` 与 **Executor（执行器）**，
+- 您在 `SharedEnvironment` 中可获得哪些数据，
+- 您需要返回什么（调度 + **多步规划**），
+- **双速率**（规划器 vs 执行器）循环中的时间/超时如何工作，
+- 如何在本地构建与测试。
+
+---
 
 ## 系统概览
 
-<img src="./image/lorr2024_system_overview.jpg" style="margin:auto;display: block;max-width:800px"/>
+下图展示 start-kit 的主要组件：
 
-上图展示了 start-kit 的系统概览。
-在每个时间步：
-1. 竞赛系统调用 `Entry` 获取提议的调度与规划，并传入存储当前机器人与调度状态的 `SharedEnv`。在内部，`Entry` 调用 `Scheduler` 计算提议的调度，并调用 `Planner` 计算提议的规划。
-2. `Entry` 返回后，提议的规划会交给 Simulator 进行验证；若提议的规划有效，Simulator 会执行该规划并返回结果状态（当前状态）。
-3. 当前状态与提议的调度随后交给 Task Manager 验证提议的调度，并检查哪些任务有进展或已完成。Task Manager 还会向系统发布新任务。
-4. 返回的当前调度、当前状态、新发布的任务及其他信息会在下一时间步通过 `SharedEnv` 传给 `Entry`。
+![system_overview](./image/system_overview.png)
 
-### 重要概念
+start-kit 为规划/调度 entry 与执行运行 **双速率控制循环**（关于中央控制器的更多说明，请参阅我们的[竞赛网页](https://www.leagueofrobotrunners.org/)）：
 
-在开始前，请熟悉代码库中的以下概念：
-- 坐标系：机器人在地图上的位置是一个元组 (x,y)，其中 x 表示机器人所在的行，y 表示所在的列。第一行（最上行）的 x = 0，第一列（最左列）的 y = 0。可视化说明见[此处](./image/coordination_system.pdf)。
-- 地图：地图是一个 `int` 的向量，索引由位置的 (行, 列) 线性化得到：(行 * 地图总列数) + 列，取值为 1 表示不可通行，0 表示可通行。
-- `State`（定义于 `inc/States.h`）：包含当前位置（地图位置索引）、当前时间步和当前朝向（0:东，1:南，2:西，3:北）的状态。
-- `Task`（定义于 `inc/Tasks.h`）：一个任务包含多个差事，存放在 `locations` 中，以及 `task_id`、被分配机器人的 id `agent_assigned` 和下一个未完成差事的索引 `idx_next_loc`。每个差事是地图上的一个位置，须按顺序依次访问。
-  若任务的第一个差事尚未完成（即 `idx_next_loc=0`），可将任务重新分配给其他机器人。
-  但一旦某机器人**开启**其分配到的任务（即完成该任务的第一个差事），该任务就不能再分配给其他机器人。
-- `Action` 枚举（定义于 `inc/ActionModel.h`）：四种动作用起始动作编码为：FW - 前进，CR - 顺时针旋转，CCR - 逆时针旋转，W - 等待，NA - 未知动作。
-- `Entry` 类是与 start-kit 主仿真的接口。每个时间步，主仿真会调用 Entry 的 compute() 函数以获取每个机器人的下一任务与下一调度。Entry 的 compute 会先调用任务调度器为每个机器人调度下一任务，再调用规划器规划下一动作。
+### A) 规划更新（慢循环）
+每隔若干执行 tick，竞赛系统会：
+1. 将最新环境信息同步到 `SharedEnvironment`（`env`），
+2. 调用 `Entry::compute(time_limit, proposed_plan, proposed_schedule)`。
 
-  
-### SharedEnv
-`SharedEnvironment` API 提供计算调度与动作所需的信息。该数据结构（在 `inc/MAPFPlanner.h`、`inc/Entry.h` 和 `inc/TaskScheduler.cpp` 中定义为 `env`）描述仿真设置与当前时间步的状态：
--  `num_of_agents`：`int`，队伍总人数。
--  `rows`：`int`，地图行数。
--  `cols`：`int`，地图列数。
--  `map_name`：`string`，地图文件名。
--  `map`：`int` 的向量，存储地图。  
--  `file_storage_path`：`string`，用于指定文件存储路径，参见「本地预处理与大文件」小节。
--  `goal_locations`：`pair<int,int>` 的向量的向量：每个机器人当前的目标位置，即已调度任务的第一个未完成差事。第一个 int 是目标位置，第二个 int 表示任务被分配的时间步。
--  `current_timestep`：`int`，仿真器中的当前时间步。*请注意，在 `plan()` 调用期间 current_timestep 可能会增加。当规划器在给定时间步超出时间限制时会发生这种情况。*
--  `curr_states`：`State` 的向量，当前时间步每个机器人的当前状态。
--  `plan_start_time`：`chrono::steady_clock::time_point`，记录 `Entry::compute()` 被调用的确切时间；`Entry::compute()` 应在 plan_start_time 之后不超过 `time_limit` 毫秒内返回提议的规划与调度。
-- `curr_task_schedule`：`vector<int>`，Task Manager 返回的当前调度。`curr_task_schedule[i]` 表示机器人 `i` 被调度的 `task_id`。`-1` 表示该机器人没有已调度的任务。
-- `task_pool`：`unordered_map<int, Task>`，该 `unordered_map` 存储所有已发布但未完成的任务，以 `task_id` 为键。
-- `new_tasks`：`vector<int>`，当前时间步新发布任务的 `task_id`。
-- `new_freeagents`：`vector<int>`，当前时间步新释放的机器人（任务已完成的机器人）的 id。
+在 `Entry::compute()` 内部（默认实现在 `src/Entry.cpp`）：
+- `TaskScheduler::plan()` 产生 `proposed_schedule`，
+- `Entry::update_goal_locations()` 更新 `env->goal_locations`，
+- `MAPFPlanner::plan()` 产生 `proposed_plan`（**多步规划**，见下文）。
 
-  
+`Entry::compute()` 返回后，系统会：
+3. 调用 **Executor** 处理新规划并更新每个智能体的 `staged_actions`（在下次规划更新前将执行的动作队列），
+4. 继续使用这些已暂存的动作执行。
+
+### B) 执行 tick（快循环）
+每个执行 tick（即使在规划运行时），系统会：
+1. 调用 Executor 决定每个智能体的执行命令（GO/STOP），
+2. 将 GO/STOP 与已暂存动作转换为本 tick 的 **请求动作**，
+3. 应用延迟（可能迫使部分智能体 STOP/等待），
+4. 用动作模型仿真一个 tick 的运动（基于连续重叠的碰撞处理），
+5. 更新机器人状态与任务进度。
+
+![system_overview](./image/sequence_diagram.png)
+上图展示 start-kit 中的交互循环。系统周期性调用 `Entry::compute(...)`，让规划器/调度器返回 **多步、栅格级** 的规划与任务调度。随后系统调用 `Executor::process_new_plan(...)` 以 **暂存** 新规划，将其与任何未完成动作合并（遵守多 tick **承诺**），并产生更新后的 `staged_actions`（以及可选的预测状态）。同时，每个 tick 系统调用 `Executor::next_command(...)` 输出每个智能体的 **GO/STOP**，应用延迟/安全检查，并推进仿真器。
+
+---
+
+## 重要概念（代码层面）
+
+开始前请熟悉代码库中的以下概念：
+
+### 坐标系
+机器人在地图上的位置为 (row, col)。
+- row 向下递增，顶部从 0 开始
+- col 向右递增，左侧从 0 开始
+
+参见 [coordination_system.pdf](./image/coordination_system.pdf)。
+
+### 地图表示
+地图为行主序的 `vector<int>`。
+(row, col) 的索引为 `row * cols + col`。
+单元格取值：
+- `1` = 障碍（不可通行）
+- `0` = 空闲（可通行）
+
+### `State`（机器人状态）
+定义于 `inc/States.h`。
+
+除 `(location, timestep, orientation)` 外，状态还包括：
+- `counter`：当前动作内的进度（`inc/Counter.h`）
+- `delay`：智能体当前是否处于延迟（`inc/Delay.h`）
+- `moveType`：智能体是否处于过渡或旋转中（`Transition / Rotation / None`）
+
+这很重要，因为动作可能需要 **多个 tick** 才能完成。
+
+### `Task`
+定义于 `inc/Tasks.h`。
+
+任务为必须按顺序访问的一系列差事（`locations`）。
+字段包括：
+- `task_id`
+- `agent_assigned`
+- `idx_next_loc`（下一个未完成差事的索引）
+
+仅当第一个差事未完成（`idx_next_loc == 0`）时可重新分配任务。
+一旦机器人开启任务（完成第一个差事），则不可再重新分配。
+
+### 规划器层 `Action`
+定义于 `inc/ActionModel.h`：
+- `FW`（前进）
+- `CR`（顺时针旋转）
+- `CCR`（逆时针旋转）
+- `W`（等待）
+- `NA`（不适用/保留；请勿在规划中输出）
+
+**规划器动作为栅格级意图**（例如 `FW` 表示「朝下一格移动」）。
+
+### 执行层 `ExecutionCommand`
+同样定义于 `inc/ActionModel.h`：
+- `GO`（本 tick 允许推进）
+- `STOP`（本 tick 暂停）
+
+执行器每个 tick 输出 `GO/STOP`；仿真器再应用动作模型与安全规则。
+
+### `Plan` 与 `staged_actions`
+- `Plan` 定义于 `inc/Plan.h`。
+- 规划存储 `plan.actions`，类型为 `vector<vector<int>>`。
+
+含义：
+- `plan.actions[i]` 为智能体 `i` 的规划器级动作序列，
+  编码为整数，对应 `Action` 枚举（`FW=0, CR=1, CCR=2, W=3, ...`）。
+
+执行器将返回的 `Plan` 转为 `staged_actions`：
+- `staged_actions[i]` 为智能体 `i` 已准备好执行的动作队列。
+- 这些暂存动作逐 tick 执行，直到采用新规划。
+
+可在 `env->staged_actions` 读取当前暂存动作。
+
+**重要说明**：在综合赛道中，您可以自定义 `Plan`，但您的执行器也需要负责理解 `Plan` 并将其转换为要暂存并交给系统的 `Action` 序列。换言之，系统只接受 `inc/ActionModel.h` 中定义的 `Action` 序列作为暂存动作。
+
+## 执行模型（计数器、延迟与基于重叠的安全）
+
+### 多 tick 动作（counter）
+`FW`、`CR`、`CCR` 需要多个执行 tick。
+进度由 `State.counter` 跟踪。
+计数器完成后，离散位置/朝向更新。
+
+### 延迟
+在延迟 tick 中，智能体被强制等待/STOP。
+这会暂停计数器进度并可能造成拥堵。
+
+### 碰撞与安全（无顶点/边规则）
+本分支不使用「顶点」或「边」冲突。
+安全由几何重叠保证：
+- 智能体建模为轴对齐正方形（「安全气泡」）
+- 障碍为实心正方形
+- 在一个 tick 上连续检查重叠（扫掠碰撞）
+
+若某智能体的请求运动不安全，动作模型可能在本 tick 将其覆盖为 `W`。
+该覆盖可按智能体发生（不一定「全员等待」）。
+
+实际含义：
+- 您的规划器可在栅格级输出无碰撞规划，但执行器/动作模型
+  仍是最终权威，仍可能因连续重叠约束、延迟与依赖解析而 STOP/等待智能体。
+
+
+## SharedEnvironment（`SharedEnv`）
+
+`SharedEnvironment` 定义于 `inc/SharedEnv.h`，以 `env` 形式提供。
+
+包含：
+
+### 静态环境信息
+- `num_of_agents`、`rows`、`cols`
+- `map_name`
+- `map`（vector<int>）
+- `file_storage_path`（用于存储/加载辅助数据）
+
+### 时间 / 执行参数
+- `plan_start_time`：系统调用 `Entry::compute()` 的时刻
+- `min_planner_communication_time`：规划更新之间的最短时间间隔（ms）
+- `action_time`：每个执行 tick 的时间预算（ms）
+- `max_counter`：完成一个动作（FW/CR/CCR）所需的 tick 数
+
+### 机器人状态视图
+系统提供两种有用的状态「视图」：
+
+- `system_states`：执行器循环中的 **当前物理状态**（逐 tick）。
+- `curr_states`：用于规划更新的 **规划快照状态**。
+  这些可能是预测/处理后的状态（例如在暂存规划窗口之后），
+  可能与 `system_states` 不同。
+
+另有：
+- `system_timestep`：当前执行 tick。
+- `curr_timestep`：预测状态的起始时间步，设为 0。
+- `staged_actions`：当前为执行暂存的每智能体动作队列。
+
+### 任务信息
+- `curr_task_schedule`：当前调度（智能体 -> task_id，或 -1）
+- `task_pool`：已发布但未完成的任务（task_id -> Task）
+- `new_tasks`：本次更新新发布的任务
+- `new_freeagents`：本次更新刚完成任务的智能体
+- `goal_locations`：每智能体下一目标（由调度推导；由 Entry 更新）
+
+> 注意：`system_timestep` 可能在 `Entry::compute()` 期间推进，因为规划运行时执行器仍在 tick。**不要假设规划期间时间冻结。**
+
+---
+
+## 时间与超时（实际行为）
+
+系统中有若干时间预算：
+
+### 预处理（硬限制）
+评测开始前会调用 `Entry::initialize(preprocess_time_limit)` 与 `Executor::initialize(int preprocess_time_limit)`。
+若任一预处理超过该限制，运行终止（退出码 124）。
+
+### 规划更新时间限制（软限制）
+`Entry::compute(time_limit, ...)` 有时间上限。
+若超时：
+- 执行器继续使用上次已接受的暂存动作进行 tick，
+- 下一次规划更新会延迟到当前规划调用结束。
+
+换言之：规划迟到会减少规划更新频率；**仿真不会冻结**。
+
+### 执行器每 tick 时间限制（软限制）
+每个执行 tick 会调用 `Executor::next_command(exec_time_limit)`。
+若过慢，您会有效损失执行时间（仿真可能通过所有智能体安全等待等行为补偿）。
+请保持 `next_command` 轻量。
+
+### 规划处理时间限制（软限制）
+`Executor::process_new_plan(sync_time_limit, ...)` 也应高效。
+若过慢，处理方式类似规划迟到，即系统会继续 tick 并调用 `next_command`，而尚无新规划。
+
+---
+
 ## Entry 集成
 
+## 规划器 / 调度器 / 执行器 API（固定）
 
-### 理解默认 entry
-在 `src/Entry.cpp` 中可找到默认的 entry 实现。在 `Entry::compute()` 中，默认 entry 先调用默认调度器。调度器完成后，机器人可能被分配新任务，其目标位置（每个机器人已调度任务的下一个差事）会写入 `env->goal_locations` 供规划器使用。
-随后，entry 调用默认规划器计算机器人的动作。
-时间限制会同时提供给默认调度器和规划器。在默认调度器与规划器内部，可见它们各自使用时间限制的一半。
+以下函数签名不得更改：
 
-#### 默认调度器
+### 调度器
+文件：`inc/TaskScheduler.h`、`src/TaskScheduler.cpp`
+- `TaskScheduler::initialize(int preprocess_time_limit)`
+- `TaskScheduler::plan(int time_limit, vector<int>& proposed_schedule)`
+
+返回：
+- `proposed_schedule[i] = task_id` 或 `-1`（无任务）
+
+无效调度示例：
+- 同一任务分配给多个智能体
+- 分配已完成/未发布/不存在的任务
+- 将已开启的任务重新分配给另一智能体
+- 对已开启任务的智能体赋 `-1`（无效）
+
+若调度无效或超时，系统保留上一份有效调度。
+
+### 规划器
+文件：`inc/MAPFPlanner.h`、`src/MAPFPlanner.cpp`
+- `MAPFPlanner::initialize(int preprocess_time_limit)`
+- `MAPFPlanner::plan(int time_limit, Plan& plan)`
+
+返回：
+- `plan.actions[i]` = 智能体 `i` 的动作序列（多步规划）
+
+**支持多步规划，且推荐使用。**
+若智能体用尽暂存动作，将被 STOP，直到有新动作暂存。
+
+### 执行器
+文件：`inc/Executor.h`、`src/Executor.cpp`
+- `Executor::initialize(int preprocess_time_limit)`
+- `Executor::process_new_plan(int sync_time_limit, Plan& plan, vector<vector<Action>>& staged_actions)`
+- `Executor::next_command(int exec_time_limit, vector<ExecutionCommand>& agent_command)`
+
+返回：
+- `process_new_plan(...)` 更新 `staged_actions` 并返回预测状态。
+- `next_command(...)` 为下一 tick 输出每智能体的 `GO/STOP`。
+
+## 理解默认组件
+
+### 默认 entry
+在 `src/Entry.cpp` 中可找到默认 entry 实现。在 `Entry::compute()` 中，默认 entry 先调用默认调度器。调度器完成后，机器人可能被分配新任务，其目标位置（每个机器人已调度任务的下一个差事）会写入 `env->goal_locations` 供规划器使用。
+随后 entry 调用默认规划器计算机器人动作。
+时间限制会同时提供给默认调度器与规划器。在默认调度器与规划器内部，可见它们各自使用时间限制的一半。
+
+### 默认调度器
 在 `src/TaskScheduler.cpp` 中可找到默认任务调度器，其调用的函数在 `default_planner/scheduler.cpp` 中进一步定义。
 - 默认调度器的预处理函数（见 `scheduler.cpp` 中的 `schedule_initialize()`）调用 `DefaultPlanner::init_heuristics()`（见 `default_planner/heuristics.cpp`）初始化全局启发式表，用于存储不同位置间的距离。这些距离在仿真过程中按需计算。调度器用这些距离估计给定机器人在给定任务上的完成时间。
 - 默认调度器的调度函数（见 `scheduler.cpp` 中的 `schedule_plan()`）实现贪心调度：每次调用 `schedule_plan()` 时，遍历每个尚未分配任务的机器人；对每个被遍历的机器人，遍历尚未分配给任何机器人的任务，将 makespan（从机器人当前位置依次经过任务所有差事的行程距离）最小的任务分配给该机器人。
 
-#### 默认规划器
+### 默认规划器
 在 `src/MAPFPlanner.cpp` 中可找到默认规划器实现，其调用的函数在 `default_planner/planner.cpp` 中进一步定义。默认规划器与默认调度器共享同一启发式距离表。其 `initialize()` 准备必要的数据结构和全局启发式表（若调度器未初始化）。其 `plan()` 为当前时间步计算无碰撞动作。
 
-默认规划器实现的 MAPF 规划器是 Traffic Flow Optimised Guided PIBT 的变体，参见 [Chen, Z., Harabor, D., Li, J., & Stuckey, P. J. (2024, March). Traffic flow optimisation for lifelong multi-agent path finding. In Proceedings of the AAAI Conference on Artificial Intelligence (Vol. 38, No. 18, pp. 20674-20682)](https://ojs.aaai.org/index.php/AAAI/article/view/30054/31856)。规划器先为每个机器人优化交通流分配，再按优化后的交通流使用 [Priority Inheritance with Backtracking](https://www.sciencedirect.com/science/article/pii/S0004370222000923) (PIBT) 计算无碰撞动作。更详细的技术报告将稍后提供。
+默认规划器实现的 MAPF 规划器是 Traffic Flow Optimised Guided PIBT 的变体，参见 [Chen, Z., Harabor, D., Li, J., & Stuckey, P. J. (2024, March). Traffic flow optimisation for lifelong multi-agent path finding. In Proceedings of the AAAI Conference on Artificial Intelligence (Vol. 38, No. 18, pp. 20674-20682)](https://ojs.aaai.org/index.php/AAAI/article/view/30054/31856)。规划器先为每个机器人优化交通流分配，再按优化后的交通流使用 [Priority Inheritance with Backtracking](https://www.sciencedirect.com/science/article/pii/S0004370222000923) (PIBT) 为多步计算无碰撞动作。
 
 > ⚠️ **注意** ⚠️，默认规划器是 anytime 算法，即用于计算解的时间会直接影响解的质量。 
 > 当分配时间较少时，默认规划器行为类似 vanilla PIBT。当分配时间较多时，默认规划器会更新交通成本并增量重算引导路径以改善到达时间。
 > 若您参加的是 Scheduling Track，请记住 `schedule_plan()` 越早返回，留给默认规划器的时间就越多。
 > 更好的规划与更好的调度都会显著影响您在排行榜上的表现。 
 > 如何在这两个组件之间分配时间是成功策略的重要一环。
-
-## 各赛道的实现内容
-
-- 调度赛道（Scheduling Track）：
-您需要实现自己的调度器，它将与默认规划器配合使用。详见 [实现您的调度器](./Prepare_Your_Submission.md#implement-your-scheduler) 小节。
-
-- 规划赛道（Planning Track）：
-您需要实现自己的规划器，它将与默认调度器配合使用。详见 [实现您的规划器](./Prepare_Your_Submission.md#implement-your-planner) 小节。
-
-- 综合赛道（Combined Track）：
-您需要同时实现自己的规划器与调度器。您也可以修改 entry 以满足需求。详见 [实现您的规划器](./Prepare_Your_Submission.md#implement-your-planner)、[实现您的调度器](./Prepare_Your_Submission.md#implement-your-scheduler) 和 [实现您的 entry](./Prepare_Your_Submission.md#implement-your-entry)。
-
-### 实现您的调度器
-
-若您只参加调度赛道，可忽略 [实现您的规划器](./Prepare_Your_Submission.md#implement-your-planner) 和 [实现您的 entry](./Prepare_Your_Submission.md#implement-your-entry)。 
-请阅读 [Entry 集成](./Prepare_Your_Submission.md#Entry-Integration) 以理解默认规划器与默认 Entry 的工作方式。
-
-实现调度器的起点是查看 `src/TaskScheduler.cpp` 和 `inc/TaskScheduler.h`。
-- 实现您自己的预处理函数 `TaskScheduler::initialize()`。 
-- 实现您自己的调度函数 `TaskScheduler::plan()`。`plan` 的输入为时间限制和一个整数向量引用作为结果调度。结果调度中第 i 个整数表示分配给第 i 个机器人的任务索引。
-- 不要修改 `TaskScheduler::initialize()` 和 `TaskScheduler::plan()` 的定义。除此以外，可自由向 `TaskScheduler` 类添加新成员/函数。
-- 不要重写任何与操作系统相关的函数（如信号处理函数）。
-- 不要干扰程序运行（如栈操作等）。
-
-每个时间步，调度器可通过 `SharedEnvironment` API 在 `env->task_pool` 中读取可分配给机器人的任务。
-调度器应向仿真环境为每个机器人返回一个任务调度。调度写入 `plan()` 的输入参数 `proposed_schedule` 向量。机器人 `i` 的调度 `proposed_schedule[i]` 为一个已开放任务的 `task_id`。以下情况为无效调度：
-- 同一任务被分配给多个智能体，
-- 包含已完成任务，
-- 已被某智能体开启的任务被重新分配给另一智能体。
-此外，将 `task_id` 设为 `-1` 表示该智能体无分配任务，会丢弃任何已有但未开启的任务。但对已开启任务的智能体赋 `-1` 会导致无效调度错误。
-
-  
-若调度器返回无效的 `proposed_schedule`，该调度会被拒绝，`current_schedule` 保持不变。
-
-
-### 实现您的规划器
-
-若您只参加规划赛道，可忽略 [实现您的调度器](./Prepare_Your_Submission.md#implement-your-scheduler) 和 [实现您的 entry](./Prepare_Your_Submission.md#implement-your-entry)。 
-请阅读 [Entry 集成](./Prepare_Your_Submission.md#Entry-Integration) 以理解默认调度器与默认 Entry 的工作方式。
-
-实现的起点是 `src/MAPFPlanner.cpp` 和 `inc/MAPFPlanner.h`。可参考 `src/MAPFPlanner.cpp` 中的示例。
-- 在提供给您的 `MAPFPlanner::initialize()` 中实现您的预处理。 
-- 在提供给您的 `MAPFPlanner::plan()` 中实现您的规划器。
-- 不要修改 `MAPFPlanner::initialize()` 和 `MAPFPlanner::plan()` 的定义。除此以外，可自由向 `MAPFPlanner` 类添加新成员/函数。
-- 不要重写任何与操作系统相关的函数（如信号处理函数）。
-- 不要干扰程序运行（如栈操作等）。
-
-每个规划回合结束时，您需为每个机器人向仿真环境返回一个 `Action`。动作写入作为 `plan()` 引用参数的 `actions` 向量。`actions[i]` 应为机器人 `i` 的有效 `Action`，不得将智能体移动到障碍物，且不得与任何其他机器人产生边或顶点冲突。若规划器返回任何无效 `Action`，该时间步所有智能体将等待。
- 
-与调度器类似，规划器可访问 `SharedEnvironment` API。您需通过该 API 读取系统当前状态。默认 `Entry` 实现会将有分配任务的智能体的下一目标位置写入 `env->goal_locations`。规划器可参考这些目标位置计算智能体的下一动作，也可通过 `env->curr_task_schedule` 获取详细任务调度与任务信息。
-
-### 实现您的 entry
-参加综合赛道的参赛者可自由修改 `Entry`、`MAPFPlanner` 和 `TaskScheduler` 以满足需求。
-您需要实现自己的 `Entry::initialize()` 和 `Entry::compute()`，且不得修改它们的定义。除此以外，可自由向 `Entry` 类添加新成员/函数。
-`Entry::compute()` 需要计算机器人的任务调度与动作。默认 entry 通过分别调用调度器和规划器完成，但这不是强制要求。
-若参加综合赛道，允许修改 `Entry::compute()` 函数。
 
 ### 默认规划器与调度器的时间参数
 
@@ -140,11 +296,38 @@
 
 允许修改这些参数的值以增减相关组件的用时。
 
+### 默认 Executor
+
+在 `src/Executor.cpp`（API 在 `inc/Executor.h`）中，默认执行器为快 tick 循环提供基线 **执行策略**。
+
+它有两项职责：
+
+1）**规划采纳与暂存**（`process_new_plan`）
+- 规划器可能返回较长的多步规划。执行器将所有新规划动作暂存到每智能体的 `staged_actions`，使系统能平滑持续执行。
+- 新规划到达时，执行器将其与已在进行中的已暂存动作合并。
+- 执行器还会生成**预测状态**快照，作为下一次规划调用的输入。这是通过仿真执行所有暂存动作后的结果状态完成的。
+
+2）**逐 tick 执行决策**（`next_command`）
+每个执行 tick，执行器为每个智能体输出一个 GO/STOP 执行命令：
+
+默认执行器基于当前局部情况构建 [**时间依赖图（Temporal Dependency Graph, TPG）**](Ma, H., Kumar, T. S., & Koenig, S. (2017, February). Multi-agent path finding with delay probabilities. In Proceedings of the AAAI Conference on Artificial Intelligence (Vol. 31, No. 1))。TPG 捕捉每个位置上智能体访问顺序的时间依赖。例如，若路径中某位置先由智能体 1 访问，再由智能体 2 访问，则执行也应遵循该顺序。当智能体 1 延迟时，智能体 2 也需等待，直到智能体 1 进入并离开该位置。换言之，执行器据此依赖结构推导 GO/STOP 决策，优先推进不违反隐含顺序的进度。
+
+## 各赛道的实现内容
+
+（若竞赛年份使用不同赛道命名，请以网站说明为准；上述 API 保持不变。）
+
+- **调度赛道（Scheduling Track）**：实现您的调度器；默认规划器 + 默认执行器与之配合运行。
+- **执行赛道（Execution Track）**：实现您的执行器；默认规划器/调度器提供意图。
+- **综合赛道（Combined Track）**：实现规划器、调度器与执行器。
+
+综合设置下也可修改 `Entry`，但不得更改 API 签名。
+
 ### 不可修改的文件
 
 除各赛道相关的实现文件及下文提到的可修改文件外，start-kit 中大部分文件不可修改，且必须确保不干扰其功能。 
 更多细节请参阅 [Evaluation_Environment.md](./Evaluation_Environment.md)。
 
+---
 
 ## 构建
 
@@ -167,70 +350,9 @@
 - 在 apt.txt 中列出依赖包。这些包须能在 Ubuntu 22 上通过 apt-get 安装。
 
 ## Python 接口
-我们基于 pybind11 为 Python 用户提供了 Python 接口。
+本竞赛阶段 Python 接口尚未就绪，**目前不支持用于提交**。
 
-依赖：[Pybind11](https://pybind11.readthedocs.io/en/stable/)
-
-pybind11 绑定实现在 `python/common`、`python/default_planner`、`python/default_scheduler`、`python/user_planner/` 和 `python/user_scheduler/` 下。
-这些实现使用户实现的 Python 调度器能与默认 C++ 规划器配合，用户实现的 Python 规划器能与默认 C++ 调度器配合。
-使用 Python 接口时，只需在以下文件中实现您的规划器和/或调度器：
-+ `python/pyMAPFPlanner.py`：用户在此实现基于 Python 的 MAPF 规划算法，并为每个机器人返回动作列表。
-+ `python/pyTaskScheduler.py`：用户在此实现基于 Python 的任务调度算法，并为每个机器人返回提议调度（任务 ID 列表）。
-
-### 赛道配置与编译
-
-竞赛各赛道使用不同的 Python 与 C++ 实现组合：
-- 调度赛道：start-kit 使用 `Python 调度器` 与 `C++ 默认规划器`。
-- 规划赛道：start-kit 使用 `Python 规划器` 与 `C++ 默认调度器`。
-- 综合赛道：start-kit 同时使用 `Python 规划器` 与 `Python 调度器`。
-
-在本地测试实现时，需在 start-kit 根目录下使用 `./python/set_track.bash` 配置对应赛道。该脚本会将所有必要的 Python 绑定文件放入 `./python/tmp` 以供编译。
-
-综合赛道：
-```shell
-./python/set_track.bash combined
-```
-调度赛道：
-```shell
-./python/set_track.bash scheduler
-```
-规划赛道：
-```shell
-./python/set_track.bash planner
-```
-
-然后编辑 compile.sh，确保仅包含以下内容：
-```shell
-mkdir build
-cmake -B build ./ -DCMAKE_BUILD_TYPE=Release -DPYTHON=true
-make -C build -j
-```
-
-使用以下命令编译并测试：
-```shell
-./compile.sh
-./build/lifelong --inputFile ./example_problems/random.domain/random_32_32_20_100.json -o test.json
-```
-编译完成后，程序会在相对于当前工作目录的 `./python` 或 `../python` 下查找 `pyMAPFPlanner` Python 模块和 `pyTaskScheduler.py`。此外，可在 `config.json` 中指定路径，并使用 cmake 选项 `-DCOPY_PY_PATH_CONFIG=ON`（会将 `config.json` 复制到目标构建目录），使程序在指定目录下查找 `pyMAPFPlanner`。
-
-也可通过 `-DPYBIND11_PYTHON_VERSION` 指定 Python 版本，或通过 `-DPYTHON_EXECUTABLE` 指定具体 Python 安装路径。
-
-例如：
-```shell
-cmake -B build ./ -DCMAKE_BUILD_TYPE=Release -DPYTHON=true -DPYBIND11_PYTHON_VERSION=3.6
-
-# 或
-
-cmake -B build ./ -DCMAKE_BUILD_TYPE=Release -DPYTHON=true -DPYTHON_EXECUTABLE=path/to/python
-```
-
-Python 包也可在评测服务器上通过 `pip` 安装，因此可在 `pip.txt` 中列出需要安装的包。
-例如，默认 `pip.txt` 包含：
-```
-torch
-pybind11-global>=2.10.1
-numpy
-```
+我们计划在正赛阶段提供完整支持的 Python 接口。
 
 ## 评测
 

@@ -86,11 +86,7 @@ pip install pybind11-global numpy
 
 对于 [Parepare_Your_Planner.md](./Prepare_Your_Submission.md) 中规定为不可修改的文件，您应始终提交其更改。
 
-⚠️ 但请注意，start-kit v2.1.0 对 `task_pool` 引入了所需的 API 变更。这需要对您的实现进行小幅修改以适配新 API。  
-该变更也会影响 `src/Entry.cpp` 中 `update_goal_locations` 函数的实现，因此升级脚本会拉取新版本的 `src/Entry.cpp` 并可能覆盖您的修改。您可以使用 `git diff` 比较差异，并决定是否撤销部分修改或部分接受该文件的更改。 
-
 升级脚本不会触碰大多数参赛者的实现文件。
-但 `python/pyMAPFPlanner.py`、`python/pyTaskScheduler.py`、`inc/MAPFPlanner.h`、`inc/TaskScheduler.h`、`src/MAPFPlanner.cpp`、`src/TaskScheduler.cpp`、`default_planner/planner.cpp` 和 `default_planner/scheduler.cpp` 中的示例实现会随新 API 和补充文档一起更新。您可能需要查看这些文件的变更。 
 
 ## 输入输出说明
 
